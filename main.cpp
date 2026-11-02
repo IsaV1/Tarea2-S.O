@@ -1,5 +1,7 @@
 #include <iostream>
 #include <vector>
+#include <pthread.h>
+#include <math.h>
 using namespace std;
 
 class Tablero{
@@ -35,6 +37,10 @@ public:
     ~Tablero() {
         pthread_mutex_destroy(&lock_tablero);
     }
+
+    //Medida de seguridad para impedir copia de una variable tipo tablero
+    Tablero(const Tablero&) = delete; //Evita instanciar un nuevo tablero copiando otro
+    Tablero& operator=(const Tablero&) = delete; // Evita copiar un tablero a otro tablero ya instanciado
 
     void estadoActual(){
         pthread_mutex_lock(&lock_tablero); //Entrada a la sección crítica
@@ -72,42 +78,92 @@ public:
     }
 
     bool movimientoValido(int filaOrigen, int columnaOrigen, int filaDestino, int columnaDestino){
-        pthread_mutex_lock(&lock_tablero); // Sección crítica protegida con POSIX
+        
         //Verificar que existan las posiciones de los argumentos
-
         // Verificar que existan las filas (índices válidos)
         if (filaOrigen < 0 || filaOrigen >= (int)filas.size() || 
             filaDestino < 0 || filaDestino >= (int)filas.size()) {
-            pthread_mutex_unlock(&lock_tablero);
+
             return false;
         }
-
+        //Nota: es necesario castear en int porque .size() entrega una variable de tipo size_t
         // Verificar límites de columnas adaptado
-        if (columnaOrigen < 0 || columnaOrigen >= (int)filas[filaOrigen].size() || 
-            columnaDestino < 0 || columnaDestino >= (int)filas[filaDestino].size()) {
-            pthread_mutex_unlock(&lock_tablero);
+        if(columnaOrigen < 0 || columnaOrigen >= (int)filas[filaOrigen].size() || 
+            columnaDestino < 0 || columnaDestino >= (int)filas[filaDestino].size()){
+
             return false;
         }
 
-        //continuar
+        //Verificación de un movimiento valido
 
+        //zona del 5x5
 
+        int diferenciaFila = abs(filaDestino-filaOrigen);  //calcular distancias
+        int diferenciaColumna = abs(columnaDestino-columnaOrigen);
 
+        if(filaOrigen >= 2 && filaDestino >= 2){ // Verificar que nos mantenemos aún en el 5x5
 
+            if(diferenciaColumna + diferenciaFila == 1){
 
+                return true;
 
+            }else{
 
+                return false;
+            }
 
-        pthread_mutex_unlock(&lock_tablero);
-        return true;
+        }
+
+        //zona del triangulo
+
+        // punta del tablero hacia fila 1
+        if((filaOrigen == 0 && filaDestino == 1)||(filaOrigen == 1 && filaDestino == 0)){
+
+            return true;
+        }
+
+        // punta del tablero hasta el centro del 5x5 (0,0) hacia (2,2) y vice versa
+        if((filaOrigen == 0 && filaDestino == 2 && columnaDestino == 2)||
+        (filaOrigen == 2 && filaDestino == 0 && columnaOrigen == 2)){
+        
+            return true;
+        }
+
+        //movimiento horizontal en la fila 1 (2 casillas solamente)
+        if(filaOrigen == 1 && filaDestino == 1){
+
+            if(diferenciaColumna == 1) {
+
+                return true;
+            }
+        }
+
+        // Conexión fila 1 hacia el 5x5
+        if(filaOrigen == 1 && filaDestino == 2){
+
+            if(abs(columnaDestino - (4 * columnaOrigen)) <= 1){
+
+                return true;
+            }
+
+        }else if(filaOrigen == 2 && filaDestino == 1){ // Desde 5x5 hacia la fila 1
+
+            if(abs(columnaOrigen - (4 * columnaDestino)) <= 1){
+
+                return true;
+            }
+        }
+
+        return false;
     }
+
+    bool movimientoValidoPerro(){}
+    bool movimientoValidoPuma(){}
 
 };
 
 int main(){
 
     Tablero test;
-    test.estadoActual();
 
-    return 0;
 }
