@@ -1,12 +1,29 @@
 #include <iostream>
 #include <vector>
-#include <string>
 #include <utility>
 #include <cstdlib>
 #include <time.h>
 #include <pthread.h>
 #include <math.h>
+#include <semaphore.h> //para poder usar semaforos
+#include <fstream> //Lectura txt
 using namespace std;
+
+
+pthread_mutex_t lock_cout = PTHREAD_MUTEX_INITIALIZER; //Es mas estetico, pero existe una condición de carrera
+//al momento de imprimir los movimientos del tablero, no afecta el funcionamiento, solo en como se imprime en consola
+
+
+struct Configuracion{ //estructura y valores default para las configuraciones de la partida
+
+    int minMs = 50;
+    int maxMs = 300;
+    unsigned int seed = 12345;
+    int filas[13];
+    int columnas[13];
+    //pos 0 para puma: -1
+    //pos 1-12 para perros del 1-12
+};
 
 class Tablero{
 
@@ -845,8 +862,9 @@ public:
             return false;
 
         }
-
         iniciado = true;
+        asignarGanador(); //Verificar si quiza los perros ya acorralaron al puma
+
         pthread_mutex_unlock(&lock_partida);
         return true;
 
@@ -923,32 +941,35 @@ public:
 
         }
 
-        string nombre = (idPieza == -1) ? "Puma" : "Perro " + to_string(idPieza);
+        pthread_mutex_lock(&lock_cout); //lock para evitar solapamiento al imprimir mensajes en cnsola
 
-        cout<<"[Partida "<<idPartida<<"] "<<nombre<<" ("<<filaOrigen<<","<<columnaOrigen<<") -> ("
-            <<filaDestino<<","<<columnaDestino<<")";
+        cout << "[Partida " << idPartida << "] ";
+
+        if(idPieza == -1){
+            cout << "Puma";
+        }else{
+            cout << "Perro " << idPieza;
+        }
+
+        cout<<" (" << filaOrigen << "," << columnaOrigen << ") -> ("<< filaDestino << "," << columnaDestino << ")";
 
         if(resultado == 2){
 
-            cout<<" CAPTURA al perro "<<idCapturado<<" (capturas: "<<tablero.getCapturas()<<")";
-
+            cout << " CAPTURA al perro " << idCapturado << " (capturas: " << tablero.getCapturas() << ")";
+            
         }
 
         cout<<endl;
 
-        if(resultado == 2){
-
-            tablero.estadoActual(); //mostramos el tablero en cada captura
-
-        }
+        tablero.estadoActual(); //mostramos el tablero
 
         if(asignarGanador()){
 
-            cout<<"[Partida "<<idPartida<<"] FIN. Ganador: jugador "<<ganador
-                <<(ganador == idJugadorPuma ? " (Puma)" : " (Perros)")<<endl;
+            cout<<"[Partida "<<idPartida<<"] FIN. Ganador: jugador "<<ganador<<(ganador == idJugadorPuma ? " (Puma)" : " (Perros)")<<endl;
 
         }
 
+        pthread_mutex_unlock(&lock_cout); // desbloqueamos el mutex para la impresión de mensajes por consola
         pthread_mutex_unlock(&lock_partida);
         return true;
     }
@@ -959,6 +980,37 @@ public:
 
     }
 
+    bool cancelarPartida(){ //cancelamos una partida en caso de un error interno 
+
+        pthread_mutex_lock(&lock_partida);
+
+        if(terminado){ //La partida ya habia terminado, por lo que no es necesario cancelarla
+
+            pthread_mutex_unlock(&lock_partida);
+            return false;
+
+        }
+
+        terminado = true;
+        ganador = -1; //ningun ganador
+
+        pthread_mutex_unlock(&lock_partida);
+        return true;
+
+    }
+
+    
+};
+
+struct ArgsArbitro{
+
+    Partida* partida;
+    int minMs;
+    int maxMs;
+    unsigned int seed; //semilla propia para los hilos
+    sem_t* mesas;//se comparte el recurso de mesas entre los arbitros para poder realizar partidas
+    //puntero porque todos los arbitros deben apuntar al mismo semaforo
+    Configuracion* config;
 };
 
 struct ArgsPieza{
@@ -988,7 +1040,14 @@ void* hiloPieza(void* arg){
         //retardo aleatorio entre minMs y maxMs
         int espera = a->minMs + (int)(rand_r(&a->seed) % (unsigned int)(a->maxMs - a->minMs + 1));
         dormirMs(espera);
-.
+
+        //en caso de que el hijo siga dormida cuando termino la partida
+        if(a -> partida -> getTerminado()){
+
+            break;
+
+        }
+
         if(!a->partida->listarDestinos(a->idPieza, destinos, destinosCaptura)){break;}
 
         if(destinos.empty()){continue;}
@@ -1003,121 +1062,297 @@ void* hiloPieza(void* arg){
     return NULL;
 }
 
+void* hiloArbitro(void* arg){
 
-//pruebaaa
-int main(int argc, char** argv){
+    ArgsArbitro* a = (ArgsArbitro*)arg;
 
-    int minMs = 50;
-    int maxMs = 300;
-    unsigned int seed = 12345;
+    //Los arbitros manejaran las mesas con los jugadores, por lo que debe esperar a que alguna mesa este disponible
 
-    if(argc >= 3){
+    if(sem_wait(a -> mesas)!= 0){
 
-        minMs = atoi(argv[1]);
-        maxMs = atoi(argv[2]);
+        //se podria usar solo sem_wait(a -> mesas), pero existe la posibilidad de que falle
 
-    }
+        cout<<"Error al esperar una mesa disponible" << endl;
 
-    if(argc >= 4){
-
-        seed = (unsigned int)atoi(argv[3]);
+        a -> partida -> cancelarPartida();
+        return NULL;
 
     }
 
-    if(minMs < 0 || maxMs < minMs){
+    //Colocamos las 13 piezas usando el struct de config
+    for(int i = 0; i<13; i++){
 
-        cerr<<"Uso: "<<argv[0]<<" [minMs maxMs [seed]]"<<endl;
+        int idPieza;
+
+        if(i == 0){
+
+            idPieza = -1; //Puma
+
+        }else{
+
+            idPieza = i; //Perros
+
+        }
+
+        if(!a->partida->colocarPieza(a -> config -> filas[i] , a -> config -> columnas[i] , idPieza ) ){ //Se coloca la pieza y luego se valida
+
+            cout<<"Error al colocar la pieza " << idPieza << endl;
+            a -> partida -> cancelarPartida();
+            sem_post(a->mesas);
+            return NULL;
+
+        }
+    }
+
+
+
+    //como ya se pusieron todas las fichas en el tablero de manera exitosa, iniciamos la partida
+
+    if(! a -> partida -> iniciarPartida()){ //Primero iniciamos la partida, y luego se comprueba la condición si es verdadera o falsa
+
+        cout<< "Error al iniciar la partida"<<endl;
+        a -> partida -> cancelarPartida();
+        sem_post(a->mesas); //liberamos el recurso
+        return NULL;
+
+    }
+
+
+    pthread_t hilos[13];//hilos de las fichas
+    ArgsPieza args[13];//estructuras de las fichas
+    int cont = 0;//contador
+
+    for(int i = 0; i<13; i++){
+        //Creamos las 13 piezas, cada pieza se asigna dentro de una posición de args[13]
+
+        args[i].partida = a -> partida;
+
+        if(i == 0){ //La pieza 0 es el puma
+            args[i].idPieza = -1;
+        }else{ // las demas piezas (del 1 al 12), se le asigna su id
+            args[i].idPieza = i;
+        }
+
+        args[i].minMs = a->minMs;
+        args[i].maxMs = a->maxMs;
+
+        args[i].seed = a->seed + (unsigned int)i; //asignamos una semilla diferente para cada ficha
+
+    }
+
+    for(int i = 0; i < 13;i++){ //creamos los 13 hilos
+
+        if(pthread_create(&hilos[i],NULL, hiloPieza, &args[i])!= 0){ // !=0 si da error
+
+            cout<<"Error al crear el hilo de la pieza "<<i << endl;
+            a->partida->cancelarPartida(); //cancelamos la partida en caso de haber un error en la creación de hilos
+  
+            break;
+        }
+
+        cont++;
+    }
+
+    for(int i = 0; i < cont; i++){ //El arbitro no termina hasta que todas las demas piezas hayan terminado
+        
+        pthread_join(hilos[i], NULL);
+
+    }
+    //Una vez terminaron los 13 hilos, el arbitro revisa el ganador del atributo partida
+
+    //recordar que existe la posibilidad de que la partida se cancele, en ese caso el id del ganador es -1
+    int ganador = a->partida->getGanador();
+
+    if(ganador ==-1){//La partida fue cancelada y no tiene ganador
+
+        cout<<"Partida cancelada" << endl;
+
+    }else{//La partida termino normalmente
+
+        cout<<"Partida finalizada, ganador id: "<< ganador<< endl;
+
+    }
+
+    sem_post(a -> mesas); //Liberamos la mesa para que otros arbitros puedan acceder
+    return NULL;
+}
+
+int main(int argc, char** argv){ //no borrar main o cambiar lo principal
+
+    if(argc < 3 || argc > 4){ //verificar ejecución correcta del programa
+
+        cout<<"Ejecución incorrecta del programa"<<endl;
         return 1;
 
     }
 
-    Partida partida(1, 100, 200); //id partida, id jugador puma, id jugador perros
+    //obtener nuestros N jugadores y M mesas
+    int N = atoi(argv[1]); 
+    int M = atoi(argv[2]);
 
-    //Disposición inicial por defecto: puma en la punta, perros en las filas 6, 5 y 4
-    if(!partida.colocarPieza(0, 0, -1)){
+    //Verificar que existan al menos 2 jugadores y que sea de a pares, y que exista al menos 1 mesa
+    if( (N < 2) || (N%2 != 0) || (M < 1)){
 
-        cerr<<"No se pudo colocar el puma"<<endl;
+        cout<<"Parametros de jugadores invalido (menos de 2 jugadores o jugadores impares)";
+        cout<<" o cantidad de mesas invalida (menor que 1 mesa)"<<endl;
         return 1;
 
     }
 
-    int idPerro = 1;
+    Configuracion configuracion;
+    //Asignamos las posiciones predeterminadas para cada ficha en el struct de configuracion
 
-    for(int f = 6; f >= 4 && idPerro <= 12; f--){
+    //posición predeterminada puma
 
-        for(int c = 0; c < 5 && idPerro <= 12; c++){
+    configuracion.filas[0] = 0;//trono como posición predeterminada
+    configuracion.columnas[0] = 0;
 
-            if(!partida.colocarPieza(f, c, idPerro)){
+    for(int i =1; i<=12; i++){ // se reutiliza logica de hiloArbitro en el posicionamiento por defecto de los perros
 
-                cerr<<"No se pudo colocar el perro "<<idPerro<<endl;
-                return 1;
+        if(i<=5){
+
+            configuracion.filas[i] = 6; //ultima fila
+            configuracion.columnas[i] = i - 1; //izq a der
+
+        }else if(i<= 10){
+
+            configuracion.filas[i] = 5; //penultima fila
+            configuracion.columnas[i] = i - 6; //izq a der
+
+        }else{
+
+            configuracion.filas[i] = 4; //antepenultima fila
+            configuracion.columnas[i] = i - 11; // izq a der
+
+        }
+    }
+    //una vez establecida las posiciones por defectos, se intenta leer el archivo, en caso de fallar se usan las posiciones por defecto
+
+    if(argc == 4){ //verificamos si se añadio un txt
+
+        ifstream archivo (argv[3]); //txt esta en la pos 4 al ejecutar programa
+
+        if(! archivo.is_open()){
+
+            cout<<"Error al abrir archivo" <<endl;
+            //simplemente se usaran las posiciones y semilla por defecto
+        }else{
+
+            Configuracion temp = configuracion; //se hace un temp en caso de que el txt no respete formato sugerido
+
+            archivo >> temp.minMs>> temp.maxMs>>temp.seed; //se guarda en temp los primeros 3 valores, que son los dos de tiempo y la semilla
+
+            for(int i= 0; i< 13; i++){
+
+                archivo >>temp.filas[i] >>temp.columnas[i]; //obtenemos las posiciones de cada ficha, recordar pos 0 para puma, 1-12 perros
 
             }
 
-            idPerro++;
+            bool validar = !archivo.fail(); //verificamos tipo de valores correctos en el txt
+
+            //verificar que las posiciones otorgadas en el txt, sean validas dentro del tablero
+            for(int i = 0; (i< 13) && validar; i++){ // se continua el for mientras validar sea verdadero
+
+                int fila = temp.filas[i];
+                int columna = temp.columnas[i];
+
+                if(fila < 0 || fila > 6 || columna < 0 || (fila == 0 && columna > 0) || (fila == 1&& columna > 1) || (fila >=2 &&columna > 4) ){
+ 
+                    validar = false; //posición invalida en el txt
+
+                }
+
+                for(int j = 0; (j < i ) && validar ; j++){ //verificar que no se repitan posiciones de las fichas
+
+                    if(fila == temp.filas[j] && columna == temp.columnas[j]){
+
+                        validar = false;
+
+                    }
+                }
+
+            }
+
+            if(! validar || temp.minMs<= 0 || temp.maxMs <= temp.minMs){ //verificar tiempos validos
+
+                    cout<< "Archivo txt invalido. Se utilizaran posiciones, tiempos y semilla predeterminados "<<endl;
+
+                }else {
+
+                    configuracion = temp; //Se pasaron todas las verificaciones, por lo que se cargan las nuevas configs
+
+                }
+
         }
+
     }
+    cout<<"SERVIDOR INICIADO"<<endl;
+    cout<<"Jugadores:" <<N<<endl;
+    cout<<"Mesas disponibles:" <<M <<endl;
+    
+    sem_t mesas; //Como se indica la existencia de M mesas, las mesas pasarian a ser un recurso limitado, por lo que se usara semaforos
 
-    if(!partida.iniciarPartida()){
+    if(sem_init(&mesas, 0, M) != 0){//Verificar que el semaforo se inicie bien (En caso de exito, ya se inicializa dentro del if)
 
-        cerr<<"No se pudo iniciar la partida (piezas incompletas)"<<endl;
+        cout<< "Error al iniciar  semaforo de mesas"<< endl;
         return 1;
 
     }
 
-    cout<<"Tablero inicial:"<<endl;
-    partida.mostrarTablero();
+    int cantidadPartidas = N/2;
 
-    pthread_t hilos[13];
-    ArgsPieza args[13];
-    bool creado[13];
+    
+    vector<Partida*> partidas(cantidadPartidas); //Vector de punteros de partidas, con tamaño de cantidadPartidas, que de momento no apuntan a nada
+    vector<pthread_t> arbitros(cantidadPartidas);// Vector de donde se almacenaran los hilos de los arbitros
+    vector<ArgsArbitro> argsArbitros(cantidadPartidas);//Almacena las estructuras de los Arbitros, de tamaño la cantidad de partidas
 
-    for(int k = 0; k < 13; k++){
 
-        creado[k] = false;
-        args[k].partida = &partida;
-        args[k].idPieza = (k == 0) ? -1 : k; //hilo 0 = puma, hilos (1-12) = perros
-        args[k].minMs = minMs;
-        args[k].maxMs = maxMs;
-        args[k].seed = seed + (unsigned int)k; //semilla distinta por hilo, reproducible
+    int contArbitros = 0; //contar la cantidad de arbitros creados nos servira para saber si se crearon todos los arbitros correctamente
+    //SI alguno no se creo, igual podremos esperar a los que si se crearon sin cerrar todo el programa
 
-    }
+    //Creación de partidas
 
-    bool falloCreacion = false;
+    for(int i = 0; i<cantidadPartidas; i++){
 
-    for(int k = 0; k < 13; k++){
+        partidas[i] = new Partida(i + 1 , 2*i + 1, 2*i + 2); //recordar el new para punteros de objetos
+        //parametro 1: id partida, parametro 2: idJugadorPuma, parametro 3: idJugadorPerros
+        //id partida parte desde 1
 
-        if(pthread_create(&hilos[k], NULL, hiloPieza, &args[k]) != 0){
+        argsArbitros[i].partida = partidas[i]; //Asignar una partida a un arbitro
+        argsArbitros[i].mesas = &mesas; //todos los arbitros comparten el mismo semaforo
 
-            cerr<<"Error al crear el hilo "<<k<<endl;
-            falloCreacion = true;
+        argsArbitros[i].config = &configuracion; //todos los arbitros compparten la misma config
+
+        argsArbitros[i].minMs = configuracion.minMs; //Retardo minimo de las piezas
+        argsArbitros[i].maxMs = configuracion.maxMs; //Retardo maximo de las piezas
+        argsArbitros[i].seed = configuracion.seed + (unsigned int)(i * 13); //Semilla distinta para cada partida
+        // el i*13 nos ayuda a que en caso de tener 2 arbitros con la misma semilla, igual generar semillas diferentes entre los 2 (13 piezas)
+
+        if(pthread_create(&arbitros[i], NULL, hiloArbitro, &argsArbitros[i]) != 0){ // !=0 si da error
+
+            cout<<"Error al crear el arbitro "<<i << endl;
+
             break;
-
         }
 
-        creado[k] = true;
+        contArbitros++;
     }
 
-    if(falloCreacion){
+    //Esperamos a que terminen todos los arbitros creados
+    for(int i = 0; i<contArbitros; i++){
 
-        partida.terminarPartida(200); //detiene a los hilos ya creados
+        pthread_join(arbitros[i], NULL);
 
     }
 
-    for(int k = 0; k < 13; k++){
+    //Liberamos la memoria de todas las partidas creadas
+    for(int i = 0; i < cantidadPartidas; i++){
 
-        if(creado[k]){
+        delete partidas[i];
 
-            pthread_join(hilos[k], NULL);
-
-        }
     }
 
-    cout<<"Tablero final:"<<endl;
-    partida.mostrarTablero();
 
-    int g = partida.getGanador();
-    cout<<"Ganador: jugador "<<g<<(g == 100 ? " (Puma)" : " (Perros)")<<endl;
-
-    return falloCreacion ? 1 : 0;
+    sem_destroy(&mesas);
+    return 0;
 }
