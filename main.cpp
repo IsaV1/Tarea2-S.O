@@ -1375,22 +1375,7 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
 
     }
 
-    //Esperamos a que todos los hilos de jugadores terminen de ejecutarse
-    //en este caso al esperar, significa que ya se formaron las parejas de los hilos que si se crearon
-    //con posibilidad de que un jugador quede sin oponente en caso de que falle la creacion de una cantidad impar de hilos
-    for(int i = 0; i < contJugadores; i++){ //se usa contJugadores, ya que no hay certeza total de que todos los N jugadores se hayan creado correctamente
-
-        pthread_join(jugadores[i], NULL);
-
-    }
-
-    //Para ver en consola que los jugadores se hayan formado de forma correcta
-    for(int i = 0; i < (int)cola.parejas.size(); i++){
-
-        cout<<"Pareja " << i + 1 << ": jugador "<< cola.parejas[i].first <<" (Puma) y jugador "<<cola.parejas[i].second <<" (Perros)" << endl;
-    }
-
-    int cantidadPartidas = (int)cola.parejas.size(); //casteamos en int por el size_t que retorna la funcion
+    int cantidadPartidas = contJugadores / 2; //cantidad de parejas con los jugadores que si lograron crearse de manera correcta
 
     
     vector<Partida*> partidas(cantidadPartidas); //Vector de punteros de partidas, con tamaño de cantidadPartidas, que de momento no apuntan a nada
@@ -1398,14 +1383,41 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
     vector<ArgsArbitro> argsArbitros(cantidadPartidas);//Almacena las estructuras de los Arbitros, de tamaño la cantidad de partidas
 
 
-    int contArbitros = 0; //contar la cantidad de arbitros creados nos servira para saber si se crearon todos los arbitros correctamente
+    //int contArbitros = 0; //contar la cantidad de arbitros creados nos servira para saber si se crearon todos los arbitros correctamente,
     //SI alguno no se creo, igual podremos esperar a los que si se crearon sin cerrar todo el programa
 
     //Creación de partidas
 
     for(int i = 0; i<cantidadPartidas; i++){
 
-        partidas[i] = new Partida(i + 1 , cola.parejas[i].first , cola.parejas[i].second);; //recordar el new para punteros de objetos
+        pthread_mutex_lock(&cola.lock_cola); //bloqueamos la cola para revisar cuantas parejas hay disponibles para crear partidas
+        //existen condiciones de carrera al revisar el vector de colas, por lo que es necesario el mutex
+
+        while( i >= (int)cola.parejas.size() ){ // si i es mayor o igual que el tamaño del vector, significa que aun no se forma una nueva pareja
+            //para crear una nueva partida, por lo que se espera hasta que exista una nueva pareja
+
+            pthread_cond_wait(&cola.cond_parejas , &cola.lock_cola);
+            //al usar cond, podemos desbloquear el mutex, para que cuando exista una modificación, despierte y vuelva a adquirir el mutex
+            //y asi continuar con la ejecución
+
+        }
+
+        //obtenemos la pareja
+        int jugadorPuma = cola.parejas[i].first;
+        int jugadorPerros = cola.parejas[i].second;
+
+        //desbloqueamos el recurso de colas
+        pthread_mutex_unlock(&cola.lock_cola);
+
+        //imprimimos la nueva pareja que se acaba de formar, existen race conditions asi que se bloquea el recurso temporalmente
+        pthread_mutex_lock(&lock_cout);
+
+        cout<<"Nueva pareja formada." <<endl;
+        cout<<"Pareja: " << i+1 <<", JugadorPuma: "<<jugadorPuma << ", JugadorPerro: "<< jugadorPerros <<endl;
+
+        pthread_mutex_unlock(&lock_cout);
+
+        partidas[i] = new Partida(i + 1, jugadorPuma, jugadorPerros); //recordar el new para punteros de objetos
         //parametro 1: id partida, parametro 2: idJugadorPuma, parametro 3: idJugadorPerros
         //id partida parte desde 1
 
@@ -1421,18 +1433,35 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
 
         if(pthread_create(&arbitros[i], NULL, hiloArbitro, &argsArbitros[i]) != 0){ // !=0 si da error
 
-            cout<<"Error al crear el arbitro "<<i << endl;
+            cout<<"Error al crear el arbitro "<<i +1<< endl;
 
-            break;
+            delete partidas[i]; //liberamos la partida que no pudo ejecutarse
+
+            partidas[i] = nullptr; //para dejar con un puntero por defecto
+
+            continue;//seguimos intentando crear nuevos arbitros
         }
 
-        contArbitros++;
     }
 
-    //Esperamos a que terminen todos los arbitros creados
-    for(int i = 0; i<contArbitros; i++){
+    //Esperamos a que todos los hilos de jugadores terminen de ejecutarse
+    //en este caso al esperar, significa que ya se formaron las parejas de los hilos que si se crearon
+    //con posibilidad de que un jugador quede sin oponente en caso de que falle la creacion de una cantidad impar de hilos,
+    for(int i = 0; i < contJugadores; i++){ //se usa contJugadores, ya que no hay certeza total de que todos los N jugadores se hayan creado correctamente
 
-        pthread_join(arbitros[i], NULL);
+        pthread_join(jugadores[i], NULL);
+
+    }
+
+
+    //Esperamos a que terminen todos los arbitros creados
+    for(int i = 0; i<cantidadPartidas; i++){
+
+        if(partidas[i]!=nullptr){//las partidas que se crearon correctamente esperaran a que terminen todos los arbitros de ejecutarse
+
+            pthread_join(arbitros[i], NULL);
+
+        }
 
     }
 
