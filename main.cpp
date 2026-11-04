@@ -1021,11 +1021,58 @@ struct ArgsPieza{
     unsigned int seed; //semilla propia de cada hilo (rand_r es seguro entre hilos)
 };
 
+
+struct ColaJugadores{ //struct para el emparejamiento de los jugadores que vayan llegando
+
+    vector<int> esperando; //Jugadores que aun no tienen oponente
+    vector<pair<int,int>> parejas; //vector de pares con los jugadores que ya tienen oponente
+    pthread_mutex_t lock_cola; //necesario ya que las modificaciones a los vectores tienen condiciones de carrera
+    pthread_cond_t cond_parejas; //variable de condicion para avisar cuando se forme una nueva pareja
+    //permite que main inicie las partidas sin esperar a que lleguen todos los jugadores (siempre y cuando hayan mesas disponibles)
+
+};
+
+struct ArgsJugador{
+
+    int idJugador;
+    ColaJugadores* cola; //puntero de colajugadores que todos compartiran
+
+};
+
 static void dormirMs(int ms){
     struct timespec ts;
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
+}
+
+void* hiloJugador(void* arg){
+
+    ArgsJugador* a = (ArgsJugador*)arg;
+
+    pthread_mutex_lock (&a -> cola -> lock_cola); //bloqueamos el recurso dentro de la propiedad cola, que corresponde a los vectores de colaJugadores
+
+    if( a -> cola -> esperando.empty() ){ //verificamos el caso de que no haya ningun jugador esperando en la cola
+        //Si no hay ningun jugador, añadimos el jugador que acaba de llegar a la cola esperando
+
+        a -> cola -> esperando.push_back(a -> idJugador);
+
+    }else{ //Si hay un jugador esperando un openente en la cola
+
+        int oponente = a -> cola -> esperando.front(); //obtonemos el id del jugador esperando
+        //hacemos la pareja
+        a -> cola -> parejas.push_back( make_pair (oponente, a -> idJugador) );
+        //sacamos al jugador que estaba esperando en el vector cola
+        a -> cola -> esperando.erase( a -> cola -> esperando.begin() );
+        //para erase es necesario usar begin()
+
+
+        pthread_cond_signal( &a -> cola -> cond_parejas); // avisamos que se formo una nueva pareja para que puedan jugar sin esperar a los demas
+    }
+
+    pthread_mutex_unlock(&a -> cola -> lock_cola); //desbloqueamos el recurso
+
+    return NULL;
 }
 
 void* hiloPieza(void* arg){
@@ -1299,7 +1346,51 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
 
     }
 
-    int cantidadPartidas = N/2;
+    ColaJugadores cola;
+    pthread_mutex_init( &cola.lock_cola , NULL); // aca es necesario inicializarlo a diferencia de los demas, que se inicializan en el constructor
+    //o como variable global
+    pthread_cond_init(&cola.cond_parejas, NULL); // iciamos la variable de condicion para saber cuando se forme una pareja sin esperar a
+    //que lleguen todos los jugadores
+
+    vector<pthread_t> jugadores(N); //vector de hilos de tamaño N jugadores
+    vector<ArgsJugador> argsJugadores(N); //almacenamos los argumentos de N jugadores
+
+    int contJugadores = 0; //contador para los jugadores que si se alcazaron a crear antes de un posible error
+
+    for(int i = 0; i<N; i++){ //ciclo con N iteraciones correcspontiente a la cantidad de jugadores
+
+        //Asignamos a cada jugador su argumento propio
+        argsJugadores[i].idJugador = i + 1; // comenzamos los id desde el 1
+        argsJugadores[i].cola = &cola;
+
+        //hilo propio para cada jugador y luego se verifica
+        if(pthread_create(&jugadores[i], NULL, hiloJugador, &argsJugadores[i]) != 0){ //!= si da error
+
+            cout << "Error al crear el hilo del jugador " << i + 1 << endl;
+            break;
+
+        }
+
+        contJugadores++;
+
+    }
+
+    //Esperamos a que todos los hilos de jugadores terminen de ejecutarse
+    //en este caso al esperar, significa que ya se formaron las parejas de los hilos que si se crearon
+    //con posibilidad de que un jugador quede sin oponente en caso de que falle la creacion de una cantidad impar de hilos
+    for(int i = 0; i < contJugadores; i++){ //se usa contJugadores, ya que no hay certeza total de que todos los N jugadores se hayan creado correctamente
+
+        pthread_join(jugadores[i], NULL);
+
+    }
+
+    //Para ver en consola que los jugadores se hayan formado de forma correcta
+    for(int i = 0; i < (int)cola.parejas.size(); i++){
+
+        cout<<"Pareja " << i + 1 << ": jugador "<< cola.parejas[i].first <<" (Puma) y jugador "<<cola.parejas[i].second <<" (Perros)" << endl;
+    }
+
+    int cantidadPartidas = (int)cola.parejas.size(); //casteamos en int por el size_t que retorna la funcion
 
     
     vector<Partida*> partidas(cantidadPartidas); //Vector de punteros de partidas, con tamaño de cantidadPartidas, que de momento no apuntan a nada
@@ -1314,7 +1405,7 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
 
     for(int i = 0; i<cantidadPartidas; i++){
 
-        partidas[i] = new Partida(i + 1 , 2*i + 1, 2*i + 2); //recordar el new para punteros de objetos
+        partidas[i] = new Partida(i + 1 , cola.parejas[i].first , cola.parejas[i].second);; //recordar el new para punteros de objetos
         //parametro 1: id partida, parametro 2: idJugadorPuma, parametro 3: idJugadorPerros
         //id partida parte desde 1
 
@@ -1352,7 +1443,11 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
 
     }
 
-
+    //liberación de recursos
     sem_destroy(&mesas);
+    pthread_mutex_destroy(&cola.lock_cola);
+    pthread_cond_destroy(&cola.cond_parejas); // destruimos la variable de condicion al finalizar el torneo
+
     return 0;
+
 }
