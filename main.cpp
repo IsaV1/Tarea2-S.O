@@ -1530,17 +1530,6 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
         pthread_mutex_lock(&cola.lock_cola); //bloqueamos la cola para revisar cuantas parejas hay disponibles para crear partidas
         //existen condiciones de carrera al revisar el vector de colas, por lo que es necesario el mutex
 
-<<<<<<< HEAD
-        while( i >= (int)cola.parejas.size() ){ // si i es mayor o igual que el tamaño del vector, significa que aun no se forma una nueva pareja
-            //para crear una nueva partida, por lo que se espera hasta que exista una nueva pareja
-
-            pthread_cond_wait(&cola.cond_parejas , &cola.lock_cola);
-            //al usar cond, podemos desbloquear el mutex, para que cuando exista una modificación, despierte y vuelva a adquirir el mutex
-            //y asi continuar con la ejecución
-
-        }
-
-=======
         while( i >= (int)cola.parejas.size() && !detenerServidor ){ // si i es mayor o igual que el tamaño del vector, significa que aun no se forma una nueva pareja
             //para crear una nueva partida, por lo que se espera hasta que exista una nueva pareja
             //tambien importante verificar que no se haya solicitado la detención del servidor
@@ -1572,7 +1561,6 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
 
         }
         
->>>>>>> d7ffad0 (implementacion de SIGINT en conjunto a un cierre ordenado)
         //obtenemos la pareja
         int jugadorPuma = cola.parejas[i].first;
         int jugadorPerros = cola.parejas[i].second;
@@ -1613,15 +1601,6 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
             continue;//seguimos intentando crear nuevos arbitros
         }
 
-<<<<<<< HEAD
-    }
-
-    //Esperamos a que todos los hilos de jugadores terminen de ejecutarse
-    //en este caso al esperar, significa que ya se formaron las parejas de los hilos que si se crearon
-    //con posibilidad de que un jugador quede sin oponente en caso de que falle la creacion de una cantidad impar de hilos,
-    for(int i = 0; i < contJugadores; i++){ //se usa contJugadores, ya que no hay certeza total de que todos los N jugadores se hayan creado correctamente
-
-=======
         pthread_mutex_lock(&cola.lock_cola);//lock para acceder a los vectores de cola
 
         cola.partidasJugador[jugadorPuma] = partidas[i];//asignamos su partida al par de jugadores correspondiente
@@ -1671,7 +1650,6 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
     //con posibilidad de que un jugador quede sin oponente en caso de que falle la creacion de una cantidad impar de hilos,
     for(int i = 0; i < contJugadores; i++){ //se usa contJugadores, ya que no hay certeza total de que todos los N jugadores se hayan creado correctamente
 
->>>>>>> d7ffad0 (implementacion de SIGINT en conjunto a un cierre ordenado)
         pthread_join(jugadores[i], NULL);
 
     }
