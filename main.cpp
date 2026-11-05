@@ -7,12 +7,22 @@
 #include <math.h>
 #include <semaphore.h> //para poder usar semaforos
 #include <fstream> //Lectura txt
+#include <signal.h> //biblioteca de C para manejar señales del sistema operativo
 using namespace std;
 
 
 pthread_mutex_t lock_cout = PTHREAD_MUTEX_INITIALIZER; //Es mas estetico, pero existe una condición de carrera
 //al momento de imprimir los movimientos del tablero, no afecta el funcionamiento, solo en como se imprime en consola
 
+volatile sig_atomic_t detenerServidor = 0; //indica si el usuario solicito detener el servidor mediante Ctrl+C (con SIGINT)
+
+void manejarSIGINT(int señal){
+
+    (void)señal; //para evitar el warning de parametro sin utilizar cuando compilamos
+
+    detenerServidor = 1; //registramos la solicitud de detener el torneo
+
+}
 
 struct Configuracion{ //estructura y valores default para las configuraciones de la partida
 
@@ -686,13 +696,14 @@ private:
     int ganador; // se inicializara en -1 (cuando termine la partida se le asigna el id del jugador puma o perro)
     Tablero tablero;
     bool iniciado;
+    int jugadorAbandono; //-1 por defecto
 
     pthread_mutex_t lock_partida;
 
 public:
     // constructor
     Partida(int id, int idJP, int idJPe) : idPartida(id), idJugadorPuma(idJP), idJugadorPerros(idJPe), 
-    terminado(false), ganador(-1), iniciado(false)
+    terminado(false), ganador(-1), iniciado(false), jugadorAbandono(-1)
     {
 
         pthread_mutex_init(&lock_partida, NULL);
@@ -980,7 +991,7 @@ public:
 
     }
 
-    bool cancelarPartida(){ //cancelamos una partida en caso de un error interno 
+    bool cancelarPartida(){ //cancelamos una partida en caso de un error interno o un SIGINT
 
         pthread_mutex_lock(&lock_partida);
 
@@ -999,7 +1010,49 @@ public:
 
     }
 
-    
+    bool abandonarPartida(int idJugador){ //metodo para terminar una partida y darle la victoria al jugador opuesto
+
+        pthread_mutex_lock(&lock_partida); //necesario debido a las race conditions
+
+        if(terminado){ //La partida ya termino anteriormente, por lo que la partida no se puede abandonar ya
+
+            pthread_mutex_unlock(&lock_partida);
+            return false;
+
+        }
+
+        //condiciones para ver quien abandono y asignar ganador por defecto
+
+        if(idJugador == idJugadorPuma){
+
+            ganador = idJugadorPerros;
+
+        }else if(idJugador == idJugadorPerros){
+
+            ganador = idJugadorPuma;
+
+        }else{ //idjugador no pertenece a la partida
+
+            pthread_mutex_unlock(&lock_partida);
+            return false;
+
+        }
+
+        jugadorAbandono = idJugador;
+        terminado = true;
+        pthread_mutex_unlock(&lock_partida);
+        return true;
+    }
+
+    int getJugadorAbandono(){
+
+        pthread_mutex_lock(&lock_partida);
+        int resultado = jugadorAbandono;
+        pthread_mutex_unlock(&lock_partida);
+
+        return resultado;
+    }
+
 };
 
 struct ArgsArbitro{
@@ -1029,6 +1082,8 @@ struct ColaJugadores{ //struct para el emparejamiento de los jugadores que vayan
     pthread_mutex_t lock_cola; //necesario ya que las modificaciones a los vectores tienen condiciones de carrera
     pthread_cond_t cond_parejas; //variable de condicion para avisar cuando se forme una nueva pareja
     //permite que main inicie las partidas sin esperar a que lleguen todos los jugadores (siempre y cuando hayan mesas disponibles)
+    vector<Partida*> partidasJugador; //Para saber a qu partida esta metida cada jugador
+    bool matchmakingCompletado = false; //servira para saber si quedan partidas por armar
 
 };
 
@@ -1052,6 +1107,16 @@ void* hiloJugador(void* arg){
 
     pthread_mutex_lock (&a -> cola -> lock_cola); //bloqueamos el recurso dentro de la propiedad cola, que corresponde a los vectores de colaJugadores
 
+
+    //verificamos si se hizo un SIGINT antes de empezar a añadir jugadores a los vectores de cola
+    if(detenerServidor){
+
+        pthread_mutex_unlock( &a -> cola -> lock_cola);//liberamos el mutex recien adquirido si se cancelo el servidor
+
+        return NULL; //terminar hilo
+    }
+
+
     if( a -> cola -> esperando.empty() ){ //verificamos el caso de que no haya ningun jugador esperando en la cola
         //Si no hay ningun jugador, añadimos el jugador que acaba de llegar a la cola esperando
 
@@ -1067,10 +1132,22 @@ void* hiloJugador(void* arg){
         //para erase es necesario usar begin()
 
 
-        pthread_cond_signal( &a -> cola -> cond_parejas); // avisamos que se formo una nueva pareja para que puedan jugar sin esperar a los demas
+        pthread_cond_broadcast( &a -> cola -> cond_parejas);//avisamos a todos los hilos que esten esperando cambios en los vectores de cola
+        //es necesario el broadcast debido a la posibilidad de un deadlock si el main y los jugadores quedan esperando la misma variable
     }
 
+    //esperamos hasta que el jugador tenga una partida asignada, recordar que por defecto su valor es nullptr
+    //tambien existe la posibilidad de que un error aparte como la creación del arbitro, por eso se añade una segunda condición
+    while( a -> cola -> partidasJugador[ a -> idJugador ] == nullptr && !( a -> cola -> matchmakingCompletado )){
+ 
+        pthread_cond_wait(&a->cola->cond_parejas, &a->cola->lock_cola);
+    
+    }
+
+
     pthread_mutex_unlock(&a -> cola -> lock_cola); //desbloqueamos el recurso
+
+    //si nunca se le asigno una partida a un jugador tendra partida == nullptr, lo que significa que hubo un error o nunca tuvo oponente
 
     return NULL;
 }
@@ -1084,9 +1161,28 @@ void* hiloPieza(void* arg){
 
     while(!a->partida->getTerminado()){
 
+        //verificamos en cada iteriación si se dio una señal SIGINT
+
+        if(detenerServidor){
+
+            a -> partida -> cancelarPartida(); //actualizamos la partida como terminada para que finalizen los hilos de piezas
+
+            break; //terminamos la ejecución por completo del hilo
+
+        }
+
         //retardo aleatorio entre minMs y maxMs
         int espera = a->minMs + (int)(rand_r(&a->seed) % (unsigned int)(a->maxMs - a->minMs + 1));
         dormirMs(espera);
+
+        if(detenerServidor){ //verificamos si justo se dio la señal SIGINT cuando el hilo dormia
+
+            a -> partida -> cancelarPartida(); //cancelamos la partida para detener todos sus hilos
+
+            break; //finalizamos el ciclo 
+
+        }
+
 
         //en caso de que el hijo siga dormida cuando termino la partida
         if(a -> partida -> getTerminado()){
@@ -1113,6 +1209,14 @@ void* hiloArbitro(void* arg){
 
     ArgsArbitro* a = (ArgsArbitro*)arg;
 
+    //en caso de que el haya un SIGINT y el arbitro este esperando una mesa a que se desocupe
+    if(detenerServidor ){ 
+ 
+        a -> partida -> cancelarPartida(); //actualizamos variable
+
+        return NULL;//terminamos el hilo del arbitro
+    }
+
     //Los arbitros manejaran las mesas con los jugadores, por lo que debe esperar a que alguna mesa este disponible
 
     if(sem_wait(a -> mesas)!= 0){
@@ -1125,6 +1229,18 @@ void* hiloArbitro(void* arg){
         return NULL;
 
     }
+
+    //caso de SIGINT cuando un arbitro este haya tomado una mesa
+
+    if(detenerServidor || a -> partida -> getTerminado()){//tambien verificar si la partida se cancelo anteriormente para devolver la mesa
+
+        a -> partida -> cancelarPartida(); //actualizamos variables
+
+        sem_post( a-> mesas ); //se devuelve la mesa que reservo el arbitro
+
+        return NULL;//terminamos el hilo del arbitro
+    }
+
 
     //Colocamos las 13 piezas usando el struct de config
     for(int i = 0; i<13; i++){
@@ -1164,7 +1280,6 @@ void* hiloArbitro(void* arg){
 
     }
 
-
     pthread_t hilos[13];//hilos de las fichas
     ArgsPieza args[13];//estructuras de las fichas
     int cont = 0;//contador
@@ -1200,6 +1315,7 @@ void* hiloArbitro(void* arg){
         cont++;
     }
 
+
     for(int i = 0; i < cont; i++){ //El arbitro no termina hasta que todas las demas piezas hayan terminado
         
         pthread_join(hilos[i], NULL);
@@ -1209,11 +1325,19 @@ void* hiloArbitro(void* arg){
 
     //recordar que existe la posibilidad de que la partida se cancele, en ese caso el id del ganador es -1
     int ganador = a->partida->getGanador();
+    int jugadorAbandono = a -> partida -> getJugadorAbandono();
+    //Si un jugador abandono, el ganador de la partida sera su oponente
 
     if(ganador ==-1){//La partida fue cancelada y no tiene ganador
 
         cout<<"Partida cancelada" << endl;
 
+    }else if(jugadorAbandono != -1 ){ //abandono un jugador
+        
+        cout<<"Partida finalizada por abandono del jugador: " <<jugadorAbandono <<endl;
+        cout<<"El ganador es jugador id: " <<ganador <<endl;
+
+    
     }else{//La partida termino normalmente
 
         cout<<"Partida finalizada, ganador id: "<< ganador<< endl;
@@ -1225,6 +1349,9 @@ void* hiloArbitro(void* arg){
 }
 
 int main(int argc, char** argv){ //no borrar main o cambiar lo principal
+
+    signal(SIGINT, manejarSIGINT); //para el manejo del ctrl+c
+
 
     if(argc < 3 || argc > 4){ //verificar ejecución correcta del programa
 
@@ -1347,6 +1474,8 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
     }
 
     ColaJugadores cola;
+    cola.partidasJugador.resize( N + 1, nullptr); //nullptr, ya que aun ningun jugador esta asociado a ninguna partida
+
     pthread_mutex_init( &cola.lock_cola , NULL); // aca es necesario inicializarlo a diferencia de los demas, que se inicializan en el constructor
     //o como variable global
     pthread_cond_init(&cola.cond_parejas, NULL); // iciamos la variable de condicion para saber cuando se forme una pareja sin esperar a
@@ -1358,6 +1487,14 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
     int contJugadores = 0; //contador para los jugadores que si se alcazaron a crear antes de un posible error
 
     for(int i = 0; i<N; i++){ //ciclo con N iteraciones correcspontiente a la cantidad de jugadores
+
+        //verificamos al principio de cada iteración si hubo una señal SIGINT
+
+        if(detenerServidor){
+
+            break; //paramos de hacer nuevos jugadores
+
+        }
 
         //Asignamos a cada jugador su argumento propio
         argsJugadores[i].idJugador = i + 1; // comenzamos los id desde el 1
@@ -1393,6 +1530,7 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
         pthread_mutex_lock(&cola.lock_cola); //bloqueamos la cola para revisar cuantas parejas hay disponibles para crear partidas
         //existen condiciones de carrera al revisar el vector de colas, por lo que es necesario el mutex
 
+<<<<<<< HEAD
         while( i >= (int)cola.parejas.size() ){ // si i es mayor o igual que el tamaño del vector, significa que aun no se forma una nueva pareja
             //para crear una nueva partida, por lo que se espera hasta que exista una nueva pareja
 
@@ -1402,6 +1540,39 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
 
         }
 
+=======
+        while( i >= (int)cola.parejas.size() && !detenerServidor ){ // si i es mayor o igual que el tamaño del vector, significa que aun no se forma una nueva pareja
+            //para crear una nueva partida, por lo que se espera hasta que exista una nueva pareja
+            //tambien importante verificar que no se haya solicitado la detención del servidor
+
+            struct timespec limite; //almacenamos el tiempo limite de espera
+
+            clock_gettime(CLOCK_REALTIME, &limite); //obtenemos la hora actual
+
+            limite.tv_sec += 1; //permitimos esperar como maximo un segundo
+
+            pthread_cond_timedwait(&cola.cond_parejas, &cola.lock_cola, &limite);
+            //al usar cond, podemos desbloquear el mutex, para que cuando exista una modificación, despierte y vuelva a adquirir el mutex
+            //y asi continuar con la ejecución
+
+
+            //desbloqueamos temporalmente el mutex y esperamos una pareja o hasta que se cumpla el tiempo
+
+            //la logica del bloque, es que si solo se usa wait, existe la posibilidad de que el hilo haya entrado en espera
+            //y que despues se de la señal SIGINT, pero el hilo seguira esperando, asi que nuca cancelara su ejecuion, por eso con timedwait
+            //el hilo despertara cada cierto tiempo para verificar ese estado
+
+        }
+
+        if(detenerServidor){ //verificamos si justo se solicito detención despues de encontrar un par para una partida
+
+            pthread_mutex_unlock(&cola.lock_cola); //liberamos el mutex antes de salir del ciclo
+
+            break; //dejamos de crear nuevas partidas
+
+        }
+        
+>>>>>>> d7ffad0 (implementacion de SIGINT en conjunto a un cierre ordenado)
         //obtenemos la pareja
         int jugadorPuma = cola.parejas[i].first;
         int jugadorPerros = cola.parejas[i].second;
@@ -1442,6 +1613,7 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
             continue;//seguimos intentando crear nuevos arbitros
         }
 
+<<<<<<< HEAD
     }
 
     //Esperamos a que todos los hilos de jugadores terminen de ejecutarse
@@ -1449,6 +1621,57 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
     //con posibilidad de que un jugador quede sin oponente en caso de que falle la creacion de una cantidad impar de hilos,
     for(int i = 0; i < contJugadores; i++){ //se usa contJugadores, ya que no hay certeza total de que todos los N jugadores se hayan creado correctamente
 
+=======
+        pthread_mutex_lock(&cola.lock_cola);//lock para acceder a los vectores de cola
+
+        cola.partidasJugador[jugadorPuma] = partidas[i];//asignamos su partida al par de jugadores correspondiente
+        cola.partidasJugador[jugadorPerros] = partidas[i];
+
+
+        pthread_cond_broadcast(&cola.cond_parejas); //avisamos que hay jugadores con partidas asignadas
+        //usamos broadcast con el cond ppara despertar a todos los hilos que estaban esperando esta condición
+
+        pthread_mutex_unlock(&cola.lock_cola);
+
+
+
+    }
+
+    //Ahora verificamos si hubo una cancelación del torneo antes de que terminen todas las partidas
+
+    if(detenerServidor){
+
+        //buscamos todas las partidas que se crearon para cancelarlas
+        for(int i = 0; i<cantidadPartidas; i++){
+
+            //verificamos que en la posición i, exista una partida
+            if(partidas[i] != nullptr){
+
+                partidas[i] -> cancelarPartida(); //cancelamos la partida para que finalicen todos los hilos
+
+            }
+
+        }
+
+    }
+
+
+    //indicamos que ya se intentaron crear todas las partidas (si falla alguna, simplemente no se reintenta, asi que se pierde esa partida)
+    //y quedan ambos jugadores sin jugar
+    pthread_mutex_lock(&cola.lock_cola); //como accedemos a una zona con race conditions es necesario los bloqueos
+
+    cola.matchmakingCompletado = true; //actualizamos a true, indicando que ya se terminaron de crear todas las partidas, incluso si alguna falla
+
+    pthread_cond_broadcast(&cola.cond_parejas); //despertamos a los jugadores que aun siguen esperando
+
+    pthread_mutex_unlock(&cola.lock_cola);
+
+    //Esperamos a que todos los hilos de jugadores terminen de ejecutarse
+    //en este caso al esperar, significa que ya se formaron las parejas de los hilos que si se crearon
+    //con posibilidad de que un jugador quede sin oponente en caso de que falle la creacion de una cantidad impar de hilos,
+    for(int i = 0; i < contJugadores; i++){ //se usa contJugadores, ya que no hay certeza total de que todos los N jugadores se hayan creado correctamente
+
+>>>>>>> d7ffad0 (implementacion de SIGINT en conjunto a un cierre ordenado)
         pthread_join(jugadores[i], NULL);
 
     }
@@ -1477,6 +1700,11 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
     pthread_mutex_destroy(&cola.lock_cola);
     pthread_cond_destroy(&cola.cond_parejas); // destruimos la variable de condicion al finalizar el torneo
 
-    return 0;
+    if(detenerServidor){ //verificamos si se cancelo el torneo antes de terminar de cerrar el programa, para asi imprimir que se cancelo
 
+        cout<<"SIGINT detectado, servidor detenido "<<endl;
+
+    }
+
+    return 0;
 }
