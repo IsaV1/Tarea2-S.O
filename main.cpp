@@ -4,23 +4,31 @@
 #include <cstdlib>
 #include <time.h>
 #include <pthread.h>
-#include <math.h>
 #include <semaphore.h> //para poder usar semaforos
 #include <fstream> //Lectura txt
 #include <signal.h> //biblioteca de C para manejar señales del sistema operativo
+#include <cerrno> //para revisar errores al convertir numeros (verificar N y M)
+#include <climits> //para verificar que no superemos el maximo de un int (verificar N y M)
+#include <atomic> //para poder compartir la señal de cierre entre todos los hilos
+#include <new> //para poder comprobar si falla la reserva de memoria
+#include <stdexcept> //para poder lanzar errores desde los constructores y no usar exit(1) y que no se cierre todo el programa
 using namespace std;
 
 
 pthread_mutex_t lock_cout = PTHREAD_MUTEX_INITIALIZER; //Es mas estetico, pero existe una condición de carrera
-//al momento de imprimir los movimientos del tablero, no afecta el funcionamiento, solo en como se imprime en consola
+//al momento de imprimir los movimientos del tablero, no afecta el funcionamiento, solo en como se imprime en consola, 
+//asi que para evitar las condiciones de carrera se crea este mutex
 
-volatile sig_atomic_t detenerServidor = 0; //indica si el usuario solicito detener el servidor mediante Ctrl+C (con SIGINT)
+atomic<bool> detenerServidor(false); //indica si se solicito detener el servidor con Ctrl+C (SIGINT)
+//verificamos que la variable atomica no necesite bloqueos internos, ya que se modifica desde SIGINT
+static_assert(atomic<bool>::is_always_lock_free, "Error con la variable atomica");
+
 
 void manejarSIGINT(int señal){
 
     (void)señal; //para evitar el warning de parametro sin utilizar cuando compilamos
 
-    detenerServidor = 1; //registramos la solicitud de detener el torneo
+    detenerServidor.store(true); //avisamos a los demas hilos que se solicito cerrar el servidor
 
 }
 
@@ -63,7 +71,15 @@ private:
 public:
     //Constructor que inicializa el mutex POSIX
     Tablero() {
-        pthread_mutex_init(&lock_tablero, NULL);
+
+        //verificamos que el mutex del tablero se haya iniciado correctamente
+        if(pthread_mutex_init(&lock_tablero, NULL) != 0){
+
+            cout<<"Error al iniciar el mutex del tablero"<<endl;
+            throw runtime_error("Error al iniciar el mutex del tablero"); //no podemos seguir usando el tablero si su mutex fallo
+
+        }
+
     }
 
     //Destructor que destruye el mutex para evitar fugas de recursos en el sistema operativo
@@ -705,8 +721,13 @@ public:
     Partida(int id, int idJP, int idJPe) : idPartida(id), idJugadorPuma(idJP), idJugadorPerros(idJPe), 
     terminado(false), ganador(-1), iniciado(false), jugadorAbandono(-1)
     {
+        //verificamos que el mutex de la partida se inicie correctamente
+        if(pthread_mutex_init(&lock_partida, NULL) != 0){
 
-        pthread_mutex_init(&lock_partida, NULL);
+            cout<<"Error al iniciar el mutex de la partida"<<endl;
+            throw runtime_error("Error al iniciar el mutex de la partida"); //no podemos continuar si falla el mutex
+
+        }
 
     }
 
@@ -879,6 +900,16 @@ public:
         pthread_mutex_unlock(&lock_partida);
         return true;
 
+    }
+
+    bool getIniciado(){
+
+        //mutex porque existenn condiciones de carrera
+        pthread_mutex_lock(&lock_partida);
+        bool resultado = iniciado;
+        pthread_mutex_unlock(&lock_partida);
+
+        return resultado;
     }
 
 private:
@@ -1091,6 +1122,7 @@ struct ArgsJugador{
 
     int idJugador;
     ColaJugadores* cola; //puntero de colajugadores que todos compartiran
+    unsigned int seed; //Usamos seed para crear un % de que un jugador abandone la partida
 
 };
 
@@ -1144,12 +1176,40 @@ void* hiloJugador(void* arg){
     
     }
 
+    Partida* partida = a -> cola ->partidasJugador[a -> idJugador]; //obtenemos la partida a la que esta asociada el jugador
 
     pthread_mutex_unlock(&a -> cola -> lock_cola); //desbloqueamos el recurso
-
     //si nunca se le asigno una partida a un jugador tendra partida == nullptr, lo que significa que hubo un error o nunca tuvo oponente
 
+    if(partida == nullptr){
+
+        return NULL;
+
+    }
+
+    //esta parte es para la situación en la que un jugador podria abandonar la partida
+    //considerando que no hay jugadores reales interactuando, por lo que la unica otra forma que un jugador
+    //abandone una partida es que exista algun fallo en el hilo o una probabilidad aleatoria como la siguiente
+    while(! partida->getTerminado() ){
+
+        dormirMs(100); //cada 100ms el hilo jugador verificara si la partida comenzo
+
+        if( (partida -> getIniciado() ) && ( !partida->getTerminado() ) && ( !detenerServidor ) ){
+            //si la partida comenzo y el servidor no esta detenido se entra a la condición
+            //y solo se puede abandonar si la partida comenzo, sigue activa y no hay ninguna señal SIGINT
+
+            //existe un 1% aprox a que se cumpla la condición, si se cumple, el jugador abandonara la partida
+            //otorgandole la victoria al oponente (al encontrar un numero dividido por 100)
+            if(rand_r(&a->seed) % 100 == 0){
+
+                partida->abandonarPartida(a->idJugador);
+
+            }
+        }
+    }
+
     return NULL;
+
 }
 
 void* hiloPieza(void* arg){
@@ -1171,15 +1231,34 @@ void* hiloPieza(void* arg){
 
         }
 
-        //retardo aleatorio entre minMs y maxMs
-        int espera = a->minMs + (int)(rand_r(&a->seed) % (unsigned int)(a->maxMs - a->minMs + 1));
-        dormirMs(espera);
+        //retardo aleatorio entre minMs y maxMs y ademas para evitar desbordamiento de int usamos 1U
+        //calculamos el rango de tiempos sin provocar desbordamientos
+        unsigned int rango = (unsigned int)(a->maxMs - a->minMs) + 1U;
+        int espera = a->minMs + (int)(rand_r(&a->seed) % rango);
 
-        if(detenerServidor){ //verificamos si justo se dio la señal SIGINT cuando el hilo dormia
+        int tiempoRestante = espera;
 
-            a -> partida -> cancelarPartida(); //cancelamos la partida para detener todos sus hilos
+        //en vez de dormir todo el tiempo de una sola vez, vamos durmiendo de a 100ms
+        //asi si la partida termina o llega un SIGINT, el hilo puede salir sin esperar tanto
+        while(tiempoRestante > 0 && !detenerServidor && !a -> partida -> getTerminado()){
 
-            break; //finalizamos el ciclo 
+            int dormir = tiempoRestante;
+
+            if(dormir > 100){
+                dormir = 100;
+            }
+
+            dormirMs(dormir);
+            tiempoRestante -= dormir;
+
+        }
+
+        //si se dio un SIGINT mientras el hilo estaba durmiendo
+        if(detenerServidor){
+
+            a -> partida -> cancelarPartida(); //cancelamos la partida para que los demas hilos tambien terminen
+
+            break;
 
         }
 
@@ -1223,7 +1302,9 @@ void* hiloArbitro(void* arg){
 
         //se podria usar solo sem_wait(a -> mesas), pero existe la posibilidad de que falle
 
+        pthread_mutex_lock(&lock_cout);
         cout<<"Error al esperar una mesa disponible" << endl;
+        pthread_mutex_unlock(&lock_cout);
 
         a -> partida -> cancelarPartida();
         return NULL;
@@ -1259,7 +1340,9 @@ void* hiloArbitro(void* arg){
 
         if(!a->partida->colocarPieza(a -> config -> filas[i] , a -> config -> columnas[i] , idPieza ) ){ //Se coloca la pieza y luego se valida
 
+            pthread_mutex_lock(&lock_cout);
             cout<<"Error al colocar la pieza " << idPieza << endl;
+            pthread_mutex_unlock(&lock_cout);
             a -> partida -> cancelarPartida();
             sem_post(a->mesas);
             return NULL;
@@ -1273,7 +1356,10 @@ void* hiloArbitro(void* arg){
 
     if(! a -> partida -> iniciarPartida()){ //Primero iniciamos la partida, y luego se comprueba la condición si es verdadera o falsa
 
+        pthread_mutex_lock(&lock_cout);
         cout<< "Error al iniciar la partida"<<endl;
+        pthread_mutex_unlock(&lock_cout);
+
         a -> partida -> cancelarPartida();
         sem_post(a->mesas); //liberamos el recurso
         return NULL;
@@ -1306,7 +1392,10 @@ void* hiloArbitro(void* arg){
 
         if(pthread_create(&hilos[i],NULL, hiloPieza, &args[i])!= 0){ // !=0 si da error
 
+            pthread_mutex_lock(&lock_cout);
             cout<<"Error al crear el hilo de la pieza "<<i << endl;
+            pthread_mutex_unlock(&lock_cout);
+
             a->partida->cancelarPartida(); //cancelamos la partida en caso de haber un error en la creación de hilos
   
             break;
@@ -1328,21 +1417,24 @@ void* hiloArbitro(void* arg){
     int jugadorAbandono = a -> partida -> getJugadorAbandono();
     //Si un jugador abandono, el ganador de la partida sera su oponente
 
-    if(ganador ==-1){//La partida fue cancelada y no tiene ganador
+    pthread_mutex_lock(&lock_cout); //bloqueamos la consola para que los mensajes del arbitro no se mezclen con los tableros
+
+    if(ganador == -1){
 
         cout<<"Partida cancelada" << endl;
 
-    }else if(jugadorAbandono != -1 ){ //abandono un jugador
-        
+    }else if(jugadorAbandono != -1 ){
+
         cout<<"Partida finalizada por abandono del jugador: " <<jugadorAbandono <<endl;
         cout<<"El ganador es jugador id: " <<ganador <<endl;
 
-    
-    }else{//La partida termino normalmente
+    }else{
 
         cout<<"Partida finalizada, ganador id: "<< ganador<< endl;
 
     }
+
+    pthread_mutex_unlock(&lock_cout); //liberamos la consola
 
     sem_post(a -> mesas); //Liberamos la mesa para que otros arbitros puedan acceder
     return NULL;
@@ -1360,18 +1452,32 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
 
     }
 
-    //obtener nuestros N jugadores y M mesas
-    int N = atoi(argv[1]); 
-    int M = atoi(argv[2]);
+    //obtener nuestros N jugadores y M mesas usamos strtol para verificar que realmente sean numeros validos
 
-    //Verificar que existan al menos 2 jugadores y que sea de a pares, y que exista al menos 1 mesa
-    if( (N < 2) || (N%2 != 0) || (M < 1)){
+    char* finN;
+    char* finM;
 
-        cout<<"Parametros de jugadores invalido (menos de 2 jugadores o jugadores impares)";
-        cout<<" o cantidad de mesas invalida (menor que 1 mesa)"<<endl;
+    errno = 0;
+    long numN = strtol(argv[1], &finN, 10);
+
+    bool errorN = (errno != 0 || *finN != '\0' || numN < 2 || numN > INT_MAX || numN % 2 != 0);
+
+    errno = 0;
+    long numM = strtol(argv[2], &finM, 10);
+
+    bool errorM = (errno != 0 || *finM != '\0' || numM < 1 || numM > INT_MAX);
+
+    //verificamos que los jugadores sean pares y que exista al menos una mesa tambien que no se hayan ingresado letras o numeros demasiado grandes
+    if(errorN || errorM){
+
+        cout<<"Parametros de jugadores o mesas invalidos"<<endl;
         return 1;
 
     }
+
+    int N = (int)numN;
+    int M = (int)numM;
+
 
     Configuracion configuracion;
     //Asignamos las posiciones predeterminadas para cada ficha en el struct de configuracion
@@ -1424,6 +1530,17 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
 
             bool validar = !archivo.fail(); //verificamos tipo de valores correctos en el txt
 
+            //verificamos que no haya contenido adicional despues de leer todos los valores del txt
+            if(validar){
+
+                char extra;
+
+                if(archivo >> extra){ //si podemos leer algo mas, significa que habia contenido sobrante
+
+                    validar = false;
+                }
+            }
+
             //verificar que las posiciones otorgadas en el txt, sean validas dentro del tablero
             for(int i = 0; (i< 13) && validar; i++){ // se continua el for mientras validar sea verdadero
 
@@ -1474,15 +1591,69 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
     }
 
     ColaJugadores cola;
-    cola.partidasJugador.resize( N + 1, nullptr); //nullptr, ya que aun ningun jugador esta asociado a ninguna partida
 
-    pthread_mutex_init( &cola.lock_cola , NULL); // aca es necesario inicializarlo a diferencia de los demas, que se inicializan en el constructor
-    //o como variable global
-    pthread_cond_init(&cola.cond_parejas, NULL); // iciamos la variable de condicion para saber cuando se forme una pareja sin esperar a
-    //que lleguen todos los jugadores
+    //intentamos reservar la memoria para guardar las partidas de los jugadores
+    try{
 
-    vector<pthread_t> jugadores(N); //vector de hilos de tamaño N jugadores
-    vector<ArgsJugador> argsJugadores(N); //almacenamos los argumentos de N jugadores
+        cola.partidasJugador.resize(N + 1, nullptr);//nullptr, ya que aun ningun jugador esta asociado a ninguna partida
+
+        //reservamos memoria antes de crear los hilos de jugadores
+        cola.esperando.reserve(1);
+        cola.parejas.reserve(N / 2);
+
+
+    }catch(...){
+
+        cout<<"Error al reservar memoria para los jugadores"<<endl;
+
+        sem_destroy(&mesas); //liberamos el semaforo que ya habiamos creado
+        return 1;
+
+    }
+
+    //iniciamos el mutex de la cola y verificamos si hubo algun error
+    if(pthread_mutex_init(&cola.lock_cola, NULL) != 0){
+
+        cout<<"Error al iniciar el mutex de la cola"<<endl;
+        sem_destroy(&mesas); //liberamos el semaforo que ya habiamos creado
+        return 1;
+
+    }
+
+    //hacemos lo mismo con la variable de condicion
+    if(pthread_cond_init(&cola.cond_parejas, NULL) != 0){
+
+        cout<<"Error al iniciar la variable de condicion"<<endl;
+
+        pthread_mutex_destroy(&cola.lock_cola); //liberamos el mutex que ya se habia creado
+        sem_destroy(&mesas);
+
+        return 1;
+
+    }
+
+    vector<pthread_t> jugadores;//vector de hilos
+    vector<ArgsJugador> argsJugadores;//almacenamos los argumentos de los jugadores
+
+    //intentamos reservar memoria para los hilos de jugadores y sus argumentos
+    try{
+
+        jugadores.resize(N);
+        argsJugadores.resize(N);
+
+    }catch(...){
+
+        cout<<"Error al reservar memoria para los hilos de jugadores"<<endl;
+
+        //liberamos los recursos que ya habiamos iniciado
+        pthread_cond_destroy(&cola.cond_parejas);
+        pthread_mutex_destroy(&cola.lock_cola);
+        sem_destroy(&mesas);
+
+        return 1;
+
+    }
+
 
     int contJugadores = 0; //contador para los jugadores que si se alcazaron a crear antes de un posible error
 
@@ -1499,6 +1670,9 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
         //Asignamos a cada jugador su argumento propio
         argsJugadores[i].idJugador = i + 1; // comenzamos los id desde el 1
         argsJugadores[i].cola = &cola;
+        argsJugadores[i].seed = configuracion.seed + 1000 + (unsigned int)i;  //semilla distinta para cada jugador, separada de las semillas de las piezas
+
+
 
         //hilo propio para cada jugador y luego se verifica
         if(pthread_create(&jugadores[i], NULL, hiloJugador, &argsJugadores[i]) != 0){ //!= si da error
@@ -1515,10 +1689,43 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
     int cantidadPartidas = contJugadores / 2; //cantidad de parejas con los jugadores que si lograron crearse de manera correcta
 
     
-    vector<Partida*> partidas(cantidadPartidas); //Vector de punteros de partidas, con tamaño de cantidadPartidas, que de momento no apuntan a nada
-    vector<pthread_t> arbitros(cantidadPartidas);// Vector de donde se almacenaran los hilos de los arbitros
-    vector<ArgsArbitro> argsArbitros(cantidadPartidas);//Almacena las estructuras de los Arbitros, de tamaño la cantidad de partidas
+    vector<Partida*> partidas; //Vector de punteros de partidas, que de momento no apuntan a nada
+    vector<pthread_t> arbitros;// Vector de donde se almacenaran los hilos de los arbitros
+    vector<ArgsArbitro> argsArbitros;//Almacena las estructuras de los Arbitros
 
+    //intentamos reservar memoria para las partidas y sus arbitros
+    try{
+
+        partidas.resize(cantidadPartidas, nullptr);
+        arbitros.resize(cantidadPartidas);
+        argsArbitros.resize(cantidadPartidas);
+
+    }catch(...){
+
+        cout<<"Error al reservar memoria para las partidas"<<endl;
+
+        //avisamos a los jugadores que no se crearan mas partidas
+        pthread_mutex_lock(&cola.lock_cola);
+
+        cola.matchmakingCompletado = true;
+        pthread_cond_broadcast(&cola.cond_parejas);
+
+        pthread_mutex_unlock(&cola.lock_cola);
+
+        //esperamos a que todos los jugadores terminen antes de liberar recursos
+        for(int i = 0; i < contJugadores; i++){
+
+            pthread_join(jugadores[i], NULL);
+
+        }
+
+        pthread_cond_destroy(&cola.cond_parejas);
+        pthread_mutex_destroy(&cola.lock_cola);
+        sem_destroy(&mesas);
+
+        return 1;
+
+    }    
 
     //int contArbitros = 0; //contar la cantidad de arbitros creados nos servira para saber si se crearon todos los arbitros correctamente,
     //SI alguno no se creo, igual podremos esperar a los que si se crearon sin cerrar todo el programa
@@ -1576,7 +1783,29 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
 
         pthread_mutex_unlock(&lock_cout);
 
-        partidas[i] = new Partida(i + 1, jugadorPuma, jugadorPerros); //recordar el new para punteros de objetos
+        //intentamos crear la partida, verificando si ocurre algun error de memoria
+        try{
+
+            partidas[i] = new Partida(i + 1, jugadorPuma, jugadorPerros); //recordar new para objeto de punteros
+
+        }catch(...){
+
+            partidas[i] = nullptr; //si falla la partida no apuntara a nada y en la siguiente condición se verifica
+
+        }
+
+        //verificamos si se pudo reservar memoria para la partida
+        if(partidas[i] == nullptr){
+
+            pthread_mutex_lock(&lock_cout);
+            cout<<"Error al crear la partida"<<endl;
+            pthread_mutex_unlock(&lock_cout);
+
+            break; //dejamos de crear partidas nuevas
+
+        }
+
+
         //parametro 1: id partida, parametro 2: idJugadorPuma, parametro 3: idJugadorPerros
         //id partida parte desde 1
 
@@ -1592,7 +1821,9 @@ int main(int argc, char** argv){ //no borrar main o cambiar lo principal
 
         if(pthread_create(&arbitros[i], NULL, hiloArbitro, &argsArbitros[i]) != 0){ // !=0 si da error
 
+            pthread_mutex_lock(&lock_cout); //evitamos que el mensaje de error se mezcle con los movimientos de otras partidas
             cout<<"Error al crear el arbitro "<<i +1<< endl;
+            pthread_mutex_unlock(&lock_cout);
 
             delete partidas[i]; //liberamos la partida que no pudo ejecutarse
 
